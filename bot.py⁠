@@ -1,117 +1,144 @@
 import os
+import asyncio
 import logging
+import shutil
+import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
 from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError
 
-# ۱. تنظیمات اولیه و لاگینگ
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
+logger = logging.getLogger(__name__)
 
-# ۲. اطلاعات توکن و کانال
-TELEGRAM_BOT_TOKEN = "8997758350:AAF-GKbBv3sPj6pC9XU4v" # توکن ربات شما
-CHANNEL_ID = "@persiandemure"                           # آیدی کانال شما
-CHANNEL_LINK = "https://t.me/persiandemure"             # لینک کانال شما
+# توکن فقط از Environment Variable خوانده می‌شود (در Render: BOT_TOKEN)
+TELEGRAM_BOT_TOKEN = os.environ["BOT_TOKEN"]
+
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "@persiandemure")
+CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "https://t.me/persiandemure")
+
+MAX_FILE_SIZE = 50 * 1024 * 1024  # محدودیت ۵۰ مگابایت تلگرام
+
 
 async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """بررسی عضویت کاربر در کانال"""
     try:
         member = await context.bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
-        if member.status in ['member', 'administrator', 'creator']:
-            return True
-        return False
+        return member.status in ("member", "administrator", "creator")
     except Exception as e:
-        logging.error(f"Error checking membership: {e}")
-        return True  # در صورت بروز خطا در چک کانال، مانع کاربر نمی‌شود
+        logger.error("Membership check failed (ربات باید ادمین کانال باشد): %s", e)
+        return False
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دستور /start"""
-    user_id = update.effective_user.id
-    is_member = await check_membership(user_id, context)
 
-    if not is_member:
-        keyboard = [
+def join_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
             [InlineKeyboardButton("عضویت در کانال", url=CHANNEL_LINK)],
-            [InlineKeyboardButton("بررسی عضویت 🔄", callback_data="check_join")]
+            [InlineKeyboardButton("بررسی عضویت 🔄", callback_data="check_join")],
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(
-            "لطفاً برای استفاده از ربات ابتدا در کانال ما عضو شوید:",
-            reply_markup=reply_markup
-        )
-        return
-
-    await update.message.reply_text(
-        "سلام! به ربات دانلودر خوش آمدید 🌹\n"
-        "لطفاً لینک ویدیو یا پست مورد نظر را ارسال کنید."
     )
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """پردازش لینک‌های ارسالی"""
-    user_id = update.effective_user.id
-    is_member = await check_membership(user_id, context)
 
-    if not is_member:
-        keyboard = [
-            [InlineKeyboardButton("عضویت در کانال", url=CHANNEL_LINK)]
-        ]
+WELCOME_TEXT = (
+    "سلام! به ربات دانلودر خوش آمدید 🌹\n"
+    "لطفاً لینک ویدیو یا پست مورد نظر را ارسال کنید."
+)
+JOIN_TEXT = "لطفا برای استفاده از ربات ابتدا در کانال ما عضو شوید:"
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not await check_membership(user_id, context):
+        await update.message.reply_text(JOIN_TEXT, reply_markup=join_keyboard())
+        return
+    await update.message.reply_text(WELCOME_TEXT)
+
+
+async def check_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    if await check_membership(user_id, context):
+        await query.answer("عضویت شما تأیید شد ✅")
+        await query.edit_message_text(WELCOME_TEXT)
+    else:
+        await query.answer("هنوز عضو کانال نشده‌اید ❌", show_alert=True)
+
+
+def download_media(url: str, out_dir: str) -> str:
+    ydl_opts = {
+        "format": "best[filesize<50M]/best[filesize_approx<50M]/best",
+        "outtmpl": os.path.join(out_dir, "%(id)s.%(ext)s"),
+        "max_filesize": MAX_FILE_SIZE,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+    }
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        return ydl.prepare_filename(info)
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not await check_membership(user_id, context):
         await update.message.reply_text(
-            "برای استفاده از امکانات ربات باید در کانال عضو باشید.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            "برای استفاده از ربات باید در کانال عضو باشید.",
+            reply_markup=join_keyboard(),
         )
         return
 
-    url = update.message.text.strip()
+    url = (update.message.text or "").strip()
     if not url.startswith(("http://", "https://")):
         await update.message.reply_text("لطفاً یک لینک معتبر ارسال کنید.")
         return
 
     status_msg = await update.message.reply_text("در حال پردازش و دانلود فایل... ⏳")
-
-    ydl_opts = {
-        'format': 'best',
-        'outtmpl': 'downloaded_media.%(ext)s',
-        'max_filesize': 50 * 1024 * 1024,  # محدودیت ۵۰ مگابایت تلگرام
-        'quiet': True,
-    }
+    work_dir = tempfile.mkdtemp(prefix="dl_")
 
     try:
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
+        filename = await asyncio.to_thread(download_media, url, work_dir)
+
+        if not os.path.exists(filename):
+            await status_msg.edit_text(
+                "فایل دانلود نشد؛ احتمالاً حجم آن بیشتر از ۵۰ مگابایت است."
+            )
+            return
+
+        if os.path.getsize(filename) > MAX_FILE_SIZE:
+            await status_msg.edit_text(
+                "حجم فایل بیشتر از ۵۰ مگابایت است و تلگرام اجازه ارسال آن را نمی‌دهد."
+            )
+            return
 
         await status_msg.edit_text("در حال ارسال فایل به تلگرام... 📤")
-        
-        with open(filename, 'rb') as media_file:
-            await update.message.reply_document(document=media_file)
-            
+
+        with open(filename, "rb") as media_file:
+            await update.message.reply_document(
+                document=media_file,
+                read_timeout=120,
+                write_timeout=120,
+            )
+
         await status_msg.delete()
 
-        # پاک‌‌سازی فایل از روی سرور پس از ارسال
-        if os.path.exists(filename):
-            os.remove(filename)
-
-    except Exception as e:
-        logging.error(f"Download Error: {e}")
-        await status_msg.edit_text("خطا در دانلود فایل. ممکن است لینک نامعتبر باشد یا حجم فایل بیش از حد مجاز باشد.")
-
-def main():
-    """شروع به کار ربات"""
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    print("Bot is running...")
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
+    except DownloadError as e:
+        logger.error("Download error for %s: %s", url, e)
+        await status_msg.edit_text(
+            "دانلود ناموفق بود. لینک ممکن است نامعتبر، خصوصی یا محدود شده باشد، "
+            "یا سایت مبدأ درخواست ربات را رد کرده باشد."
+        )
+    except Ex
