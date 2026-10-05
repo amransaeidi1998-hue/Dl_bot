@@ -1,0 +1,101 @@
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+)
+from yt_dlp import YoutubeDL
+
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+# --- تنظیمات اختصاصی ربات شما ---
+TELEGRAM_BOT_TOKEN = "8997758350:AAF-GKbBv3th5gYqW2NL5qzJSQs3WnRALqo"
+CHANNEL_ID = "@persiandemure"                  # آیدی کانال شما
+CHANNEL_LINK = "https://t.me/persiandemure"    # لینک مستقیم کانال شما
+
+async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """بررسی عضویت کاربر در کانال"""
+    try:
+        member = await context.bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        if member.status in ['member', 'administrator', 'creator']:
+            return True
+        return False
+    except Exception as e:
+        logging.error(f"Error checking membership: {e}")
+        return False
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دستور /start"""
+    welcome_msg = (
+        "👋 **به ربات دانلود مستقیم اینستاگرام و یوتیوب خوش آمدید!**\n\n"
+        "کافیست لینک ویدیو از **اینستاگرام** یا **یوتیوب** را بفرستید تا لینک دانلود مستقیم دریافت کنید."
+    )
+    await update.message.reply_text(welcome_msg, parse_mode="Markdown")
+
+def extract_direct_link(url: str):
+    """استخراج لینک مستقیم بدون دانلود روی سرور"""
+    ydl_opts = {
+        'format': 'best',
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True,
+    }
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        direct_url = info.get('url')
+        title = info.get('title', 'ویدیو')
+        return direct_url, title
+
+async def process_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """پردازش لینک‌های ارسال شده"""
+    user_id = update.message.from_user.id
+    user_url = update.message.text.strip()
+
+    # ۱. بررسی قفل عضویت اجباری (Force Join)
+    is_member = await check_membership(user_id, context)
+    if not is_member:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 عضویت در کانال", url=CHANNEL_LINK)],
+            [InlineKeyboardButton("✅ عضو شدم / دریافت لینک", callback_data=f"check_{user_id}")]
+        ])
+        await update.message.reply_text(
+            "⚠️ **برای استفاده از ربات، ابتدا باید در کانال ما عضو شوید:**\n\n"
+            "پس از عضویت، مجدداً لینک خود را ارسال کنید.",
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
+        return
+
+    # ۲. دریافت لینک مستقیم
+    status_msg = await update.message.reply_text("⏳ در حال استخراج لینک دانلود مستقیم...")
+
+    try:
+        direct_url, title = extract_direct_link(user_url)
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📥 دانلود مستقیم ویدیو", url=direct_url)],
+            [InlineKeyboardButton("📢 عضویت در کانال ما", url=CHANNEL_LINK)]
+        ])
+
+        response_text = (
+            f"🎬 **عنوان:** {title}\n\n"
+            f"✅ **لینک دانلود مستقیم آماده شد!**\n"
+            f"روی دکمه زیر کلیک کنید تا دانلود بدون درگیر شدن سرور انجام شود:"
+        )
+
+        await status_msg.edit_text(response_text, parse_mode="Markdown", reply_markup=keyboard)
+
+    except Exception as e:
+        logging.error(f"Extraction error: {e}")
+        await status_msg.edit_text("❌ خطایی در دریافت لینک رخ داد. مطمئن شوید لینک معتبر و عمومی است.")
+
+def main():
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_link))
+
+    print("ربات فعال شد...")
+    app.run_polling()
+
+if __name__ == '__main__':
+    main()
